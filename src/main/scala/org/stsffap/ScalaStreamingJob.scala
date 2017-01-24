@@ -18,56 +18,47 @@ package org.stsffap
  * limitations under the License.
  */
 
-import org.apache.flink.api.scala.table._
-import org.apache.flink.api.table.{Row, Table, TableEnvironment}
+import org.apache.flink.api.scala._
 import org.apache.flink.cep.scala.CEP
 import org.apache.flink.cep.scala.pattern.Pattern
-import org.apache.flink.streaming.api.scala._
+import org.apache.flink.core.fs.FileSystem
+import org.apache.flink.streaming.api.scala.{DataStream, StreamExecutionEnvironment}
 import org.apache.flink.streaming.api.windowing.time.Time
 
 object ScalaStreamingJob {
   def main(args: Array[String]) {
     val env = StreamExecutionEnvironment.getExecutionEnvironment
-    val tableEnv = TableEnvironment.getTableEnvironment(env)
 
-    val input = env.fromElements(Order(1,1), Shipment(1,2), Delivery(1, 3), Order(2, 2), Order(3, 14))
-
-    val inputTable = input.toTable(tableEnv, 'orderId as 'orderId, 'timestamp as 'time, 'status as 'status)
-
-    // calculate the number of orders per hour
-    val ordersPerHour: Table = inputTable
-      .where('status === "Received")
-      .window(Tumble over 1.day on 'time as 'w)
-      .select('orderId.count)
-
-    ordersPerHour.toDataStream[Row].print()
+    val input = env.fromElements(Order(1,1), Shipment(1,2), Delivery(1, 3),
+      Order(2, 1), Order(3, 1), Shipment(2, 2), Delivery(2, 11))
 
     // calculate the processing warnings
-    val processingPattern = Pattern.begin[Event]("received").subtype(classOf[Order])
+    val processingPattern = Pattern.begin[Event]("ordered").subtype(classOf[Order])
       .followedBy("shipped").subtype(classOf[Shipment])
-      .within(Time.hours(1))
+      .within(Time.milliseconds(5))
 
     val processingPatternStream = CEP.pattern(input.keyBy("orderId"), processingPattern)
 
     val processingResult: DataStream[Either[ProcessingWarning, ProcessingSuccess]] = processingPatternStream.select {
-      (partialPattern, timestamp) => ProcessingWarning(partialPattern("received").orderId, timestamp)
+      (partialPattern, timestamp) => ProcessingWarning(partialPattern("ordered").orderId, timestamp)
     } {
       fullPattern =>
         ProcessingSuccess(
-          fullPattern("received").orderId,
+          fullPattern("ordered").orderId,
           fullPattern("shipped").timestamp,
-          fullPattern("shipped").timestamp - fullPattern("received").timestamp)
+          fullPattern("shipped").timestamp - fullPattern("ordered").timestamp)
     }
 
     // calculate the delivery warnings
     val deliveryPattern = Pattern.begin[Event]("shipped").where(_.status == "Shipped")
       .followedBy("delivered").where(_.status == "Delivered")
-      .within(Time.days(1))
+      .within(Time.milliseconds(10))
+
 
     val deliveryPatternStream = CEP.pattern(input.keyBy("orderId"), deliveryPattern)
 
     val deliveryResult: DataStream[Either[DeliveryWarning, DeliverySuccess]] = deliveryPatternStream.select {
-      (partialPattern, timestamp) => DeliveryWarning(partialPattern("shipped").orderId, timestamp)
+      (partialPattern, tstamp) => DeliveryWarning(partialPattern("shipped").orderId, tstamp)
     } {
       fullPattern =>
         DeliverySuccess(
@@ -83,43 +74,9 @@ object ScalaStreamingJob {
 
     val deliveryWarnings = deliveryResult.flatMap (_.left.toOption)
 
-    val processingWarningTable = processingWarnings.toTable(tableEnv)
-    val deliveryWarningTable = deliveryWarnings.toTable(tableEnv)
-    val processingSuccessTable = processingSuccesses.toTable(tableEnv)
-
-    tableEnv.registerTable("processingWarnings", processingWarningTable)
-    tableEnv.registerTable("deliveryWarnings", deliveryWarningTable)
-    tableEnv.registerTable("processingSuccesses", processingSuccessTable)
-
-    // calculate the processing warnings per hour
-    val processingWarningsPerHour = tableEnv.sql(
-      """SELECT STREAM
-        |TUMBLE_START(timestamp, INTERVAL ‘1’ HOUR) AS hour,
-        |COUNT(*) AS cnt
-        |FROM processingWarnings
-        |GROUP BY TUMBLE(timestamp, INTERVAL ‘1’ HOUR)""".stripMargin)
-
-    // calculate the delivery warnings per hour
-    val deliveryWarningsPerHour = tableEnv.sql(
-      """SELECT STREAM
-        |TUMBLE_START(timestamp, INTERVAL ‘1’ HOUR) AS hour,
-        |COUNT(*) AS cnt
-        |FROM deliveryWarnings
-        |GROUP BY TUMBLE(timestamp, INTERVAL ‘1’ HOUR)""".stripMargin)
-
-    // calculate the average processing time
-    val averageProcessingTime = tableEnv.sql(
-      """SELECT STREAM
-        |TUMBLE_START(timestamp, INTERVAL '1' DAY) AS day,
-        |AVG(duration) AS avgDuration
-        |FROM processingSuccesses
-        |GROUP BY TUMBLE(timestamp, INTERVAL '1' DAY)
-      """.stripMargin
-    )
-
-    processingWarningsPerHour.toDataStream[Row].print();
-    deliveryWarningsPerHour.toDataStream[Row].print();
-    averageProcessingTime.toDataStream[Row].print();
+    processingWarnings.writeAsCsv("/tmp/flink-out/processsingWarnings.csv/", FileSystem.WriteMode.OVERWRITE)
+    processingSuccesses.writeAsCsv("/tmp/flink-out/processsingSuccesses.csv/", FileSystem.WriteMode.OVERWRITE)
+    deliveryWarnings.writeAsCsv("/tmp/flink-out/deliveryWarnings.csv", FileSystem.WriteMode.OVERWRITE)
 
     env.execute("Flink Streaming Scala API Skeleton")
   }
