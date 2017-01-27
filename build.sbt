@@ -7,7 +7,7 @@ version := "1.0"
 
 scalaVersion in ThisBuild := "2.11.8"
 
-val flinkVersion = "1.2-SNAPSHOT"
+val flinkVersion = "1.3-SNAPSHOT"
 
 val flinkDependencies = Seq(
   "org.apache.flink" %% "flink-scala" % flinkVersion % "provided",

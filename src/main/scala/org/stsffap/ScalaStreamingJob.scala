@@ -22,27 +22,37 @@ import org.apache.flink.api.scala._
 import org.apache.flink.cep.scala.CEP
 import org.apache.flink.cep.scala.pattern.Pattern
 import org.apache.flink.core.fs.FileSystem
+import org.apache.flink.streaming.api.TimeCharacteristic
+import org.apache.flink.streaming.api.functions.AssignerWithPeriodicWatermarks
 import org.apache.flink.streaming.api.scala.{DataStream, StreamExecutionEnvironment}
+import org.apache.flink.streaming.api.watermark.Watermark
 import org.apache.flink.streaming.api.windowing.time.Time
 
 object ScalaStreamingJob {
   def main(args: Array[String]) {
     val env = StreamExecutionEnvironment.getExecutionEnvironment
 
-    val input = env.fromElements(Order(1,1), Shipment(1,2), Delivery(1, 3),
-      Order(2, 1), Order(3, 1), Shipment(2, 2), Delivery(2, 11))
+   env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime)
+
+    val input = env.fromElements(Order(1,1), Shipment(1,3), Delivery(1, 5),
+      Order(2, 2), Order(3, 6), Shipment(2, 4), Delivery(2, 21))
+      //.assignTimestampsAndWatermarks(new TimeLagWatermarkGenerator())
+      .assignAscendingTimestamps( _.timestamp )
+      .keyBy("orderId")
+
+    input.getExecutionConfig.setAutoWatermarkInterval(1000L)
 
     // calculate the processing warnings
     val processingPattern = Pattern.begin[Event]("ordered").subtype(classOf[Order])
       .followedBy("shipped").subtype(classOf[Shipment])
       .within(Time.milliseconds(5))
 
-    val processingPatternStream = CEP.pattern(input.keyBy("orderId"), processingPattern)
+    val processingPatternStream = CEP.pattern(input, processingPattern)
 
     val processingResult: DataStream[Either[ProcessingWarning, ProcessingSuccess]] = processingPatternStream.select {
       (partialPattern, timestamp) => ProcessingWarning(partialPattern("ordered").orderId, timestamp)
     } {
-      fullPattern =>
+      fullPattern => 
         ProcessingSuccess(
           fullPattern("ordered").orderId,
           fullPattern("shipped").timestamp,
@@ -52,10 +62,10 @@ object ScalaStreamingJob {
     // calculate the delivery warnings
     val deliveryPattern = Pattern.begin[Event]("shipped").where(_.status == "Shipped")
       .followedBy("delivered").where(_.status == "Delivered")
-      .within(Time.milliseconds(10))
+      .within(Time.milliseconds(8))
 
 
-    val deliveryPatternStream = CEP.pattern(input.keyBy("orderId"), deliveryPattern)
+    val deliveryPatternStream = CEP.pattern(input, deliveryPattern)
 
     val deliveryResult: DataStream[Either[DeliveryWarning, DeliverySuccess]] = deliveryPatternStream.select {
       (partialPattern, tstamp) => DeliveryWarning(partialPattern("shipped").orderId, tstamp)
@@ -73,12 +83,32 @@ object ScalaStreamingJob {
     val processingSuccesses = processingResult.flatMap (_.right.toOption)
 
     val deliveryWarnings = deliveryResult.flatMap (_.left.toOption)
+    val deliverySuccesses = deliveryResult.flatMap (_.right.toOption)
 
-    processingWarnings.writeAsCsv("/tmp/flink-out/processsingWarnings.csv/", FileSystem.WriteMode.OVERWRITE)
-    processingSuccesses.writeAsCsv("/tmp/flink-out/processsingSuccesses.csv/", FileSystem.WriteMode.OVERWRITE)
+    processingWarnings.writeAsCsv("/tmp/flink-out/processsingWarnings.csv", FileSystem.WriteMode.OVERWRITE)
+    processingSuccesses.writeAsCsv("/tmp/flink-out/processsingSuccesses.csv", FileSystem.WriteMode.OVERWRITE)
     deliveryWarnings.writeAsCsv("/tmp/flink-out/deliveryWarnings.csv", FileSystem.WriteMode.OVERWRITE)
+    deliverySuccesses.writeAsCsv("/tmp/flink-out/deliverySuccesses.csv", FileSystem.WriteMode.OVERWRITE)
 
     env.execute("Flink Streaming Scala API Skeleton")
+  }
+}
+
+/**
+  * This generator generates watermarks that are lagging behind processing time by a certain amount.
+  * It assumes that elements arrive in Flink after at most a certain time.
+  */
+class TimeLagWatermarkGenerator extends AssignerWithPeriodicWatermarks[Event] {
+
+  val maxTimeLag = 1L; // 5 milliseconds
+
+  override def extractTimestamp(element: Event, previousElementTimestamp: Long): Long = {
+    element.timestamp
+  }
+
+  override def getCurrentWatermark(): Watermark = {
+    // return the watermark as current time minus the maximum time lag
+    new Watermark(System.currentTimeMillis() - maxTimeLag)
   }
 }
 
